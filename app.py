@@ -4,59 +4,69 @@ import numpy as np
 from datetime import timedelta
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
-
-from supabase import create_client, Client
+import requests
 
 # ==========================================================
-# Conexão com Supabase
+# Configuração
 # ==========================================================
-SUPABASE_URL = "https://kunzcmsbrljxdeyeeqgi.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imt1bnpjbXNicmxqeGRleWVlcWdpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMzMjQ0NzgsImV4cCI6MjA3ODkwMDQ3OH0.d12uEEyndup2ABz674seiuhHQgXR98ESUXupfogx1J4"
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+API_URL = "https://kunzcmsbrljxdeyeeqgi.supabase.co/functions/v1/get-timepoints"
 
 st.set_page_config(page_title="N-of-1 Oncology Dashboard", layout="wide")
 
 st.title("🧬 N-of-1 Oncology Dashboard – Tumor Burden Predictor")
 st.markdown("""
-Este dashboard lê automaticamente os dados do paciente direto do Supabase,
+Este dashboard lê automaticamente os dados do paciente direto do banco de dados,
 sem necessidade de upload de CSV.
 """)
-
 
 # ==========================================================
 # 1. Seleção do Caso + Carregamento
 # ==========================================================
 st.header("📂 1. Selecione o Caso")
 
-case_id = st.text_input("Digite o case_id do paciente:", placeholder="ex: d1504f59-xxxx-xxxx")
-
-if not case_id:
-    st.stop()
-
-# Buscar timepoints na tabela
-query = (
-    supabase.table("timepoints")
-    .select("*")
-    .eq("case_id", case_id)
-    .order("date", desc=False)
+case_id = st.text_input(
+    "Digite o case_id do paciente:", 
+    placeholder="ex: 91e64fea-3d77-4a53-a4cb-43b6fe87123a"
 )
 
-response = query.execute()
-
-if len(response.data) == 0:
-    st.error("Nenhum timepoint encontrado para esse case_id.")
+if not case_id:
+    st.info("👆 Digite o ID do caso para começar")
     st.stop()
 
-df = pd.DataFrame(response.data)
-
-# Converter colunas
-df["date"] = pd.to_datetime(df["date"])
-df["sum_mm"] = pd.to_numeric(df["sum_mm"], errors="coerce")
-
-st.write("### 🔍 Timepoints carregados:")
-st.dataframe(df)
-
+# Buscar dados via API REST
+try:
+    response = requests.get(f"{API_URL}?case_id={case_id}")
+    response.raise_for_status()
+    
+    result = response.json()
+    
+    if "error" in result:
+        st.error(f"Erro: {result['error']}")
+        st.stop()
+    
+    if len(result["data"]) == 0:
+        st.error("Nenhum timepoint encontrado para esse case_id.")
+        st.stop()
+    
+    df = pd.DataFrame(result["data"])
+    
+    # Converter colunas
+    df["date"] = pd.to_datetime(df["date"])
+    df["sum_mm"] = pd.to_numeric(df["sum_mm"], errors="coerce")
+    
+    # Remover linhas sem tumor_burden
+    df = df.dropna(subset=["sum_mm"])
+    
+    if len(df) == 0:
+        st.warning("Não há dados de tumor burden disponíveis para este caso.")
+        st.stop()
+    
+    st.write("### 🔍 Timepoints carregados:")
+    st.dataframe(df[["date", "sum_mm", "event_date", "source_type"]])
+    
+except requests.exceptions.RequestException as e:
+    st.error(f"Erro ao conectar com a API: {str(e)}")
+    st.stop()
 
 # ==========================================================
 # 2. Modelagem preditiva
@@ -76,14 +86,21 @@ model.fit(X, y)
 slope = model.coef_[0]
 intercept = model.intercept_
 
-st.write(f"**Slope (mm/dia):** `{slope:.4f}`")
-st.write(f"**Intercept:** `{intercept:.2f}`")
+col1, col2 = st.columns(2)
+with col1:
+    st.metric("Slope (mm/dia)", f"{slope:.4f}")
+with col2:
+    st.metric("Intercept", f"{intercept:.2f}")
 
 future_days = st.multiselect(
     "Selecione horizontes de previsão (em dias):",
     [30, 60, 90, 120, 180, 240, 360],
     default=[30, 90, 180]
 )
+
+if not future_days:
+    st.warning("Selecione ao menos um horizonte de previsão.")
+    st.stop()
 
 preds = {
     "days": future_days,
@@ -96,25 +113,29 @@ pred_df = pd.DataFrame(preds)
 st.write("### 📈 Previsões:")
 st.table(pred_df)
 
-
 # ==========================================================
 # 3. Gráfico
 # ==========================================================
 st.header("📊 3. Curva — Real vs Predito")
 
-fig, ax = plt.subplots(figsize=(10, 5))
+fig, ax = plt.subplots(figsize=(12, 6))
 
-ax.plot(df["date"], df["sum_mm"], marker="o", linewidth=3, label="Real")
-ax.plot(pred_df["date"], pred_df["predicted_sum_mm"], marker="x", linestyle="--", linewidth=2, label="Predito")
+# Converter dates para plot
+pred_dates = pd.to_datetime(pred_df["date"])
 
-ax.set_xlabel("Data")
-ax.set_ylabel("Tumor burden (mm)")
-ax.set_title("N-of-1 – Evolução do Tumor")
-ax.grid(True)
-ax.legend()
+ax.plot(df["date"], df["sum_mm"], marker="o", linewidth=3, markersize=8, label="Real", color="#2563eb")
+ax.plot(pred_dates, pred_df["predicted_sum_mm"], marker="x", linestyle="--", linewidth=2, markersize=10, label="Predito", color="#dc2626")
+
+ax.set_xlabel("Data", fontsize=12)
+ax.set_ylabel("Tumor burden (mm)", fontsize=12)
+ax.set_title("N-of-1 – Evolução do Tumor", fontsize=14, fontweight="bold")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=11)
+
+plt.xticks(rotation=45)
+plt.tight_layout()
 
 st.pyplot(fig)
-
 
 # ==========================================================
 # 4. Probabilidade heurística de progressão
@@ -125,13 +146,20 @@ prob_pd = float(np.clip((slope / 1.0) * 100 + 50, 0, 100))
 
 st.metric(
     label="Probabilidade aproximada de progressão nos próximos 6 meses",
-    value=f"{prob_pd:.1f}%"
+    value=f"{prob_pd:.1f}%",
+    delta=f"Slope: {slope:.4f} mm/dia"
 )
+
+if slope > 0:
+    st.error("⚠️ Tendência de crescimento do tumor detectada")
+elif slope < -0.5:
+    st.success("✅ Tendência de redução significativa do tumor")
+else:
+    st.info("ℹ️ Tumor burden estável")
 
 st.caption("""
 *Obs.: baseado no slope atual; para probabilidade real use modelo Bayesiano.*
 """)
-
 
 # ==========================================================
 # 5. Exportação
@@ -140,10 +168,25 @@ st.header("📤 5. Exportar Previsões")
 
 csv = pred_df.to_csv(index=False).encode("utf-8")
 st.download_button(
-    label="⬇️ Baixar CSV",
+    label="⬇️ Baixar CSV de Previsões",
     data=csv,
-    file_name="n_of_1_predictions.csv",
+    file_name=f"n_of_1_predictions_{case_id[:8]}.csv",
     mime="text/csv"
 )
 
-st.success("Dashboard carregado com sucesso!")
+# Exportar dados brutos também
+csv_raw = df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="⬇️ Baixar Dados Brutos",
+    data=csv_raw,
+    file_name=f"n_of_1_raw_data_{case_id[:8]}.csv",
+    mime="text/csv"
+)
+
+st.success("✅ Dashboard carregado com sucesso!")
+
+# ==========================================================
+# Footer
+# ==========================================================
+st.divider()
+st.caption("N-of-1 Oncology Dashboard | Powered by Lovable Cloud")
